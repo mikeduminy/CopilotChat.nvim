@@ -5,8 +5,21 @@ local notify = require('CopilotChat.notify')
 local utils = require('CopilotChat.utils')
 local curl = require('CopilotChat.utils.curl')
 local files = require('CopilotChat.utils.files')
+local log = require('plenary.log')
 
 local EDITOR_VERSION = 'Neovim/' .. vim.version().major .. '.' .. vim.version().minor .. '.' .. vim.version().patch
+
+---@class CopilotChat
+---@field config CopilotChat.config.Config
+---@field chat CopilotChat.ui.chat.Chat
+local MC = setmetatable({}, {
+  __index = function(t, key)
+    if key == 'config' then
+      return require('CopilotChat.config')
+    end
+    return rawget(t, key)
+  end,
+})
 
 local token_cache = nil
 local unsaved_token_cache = {}
@@ -57,7 +70,7 @@ end
 ---@return string
 local function github_device_flow(tag, client_id, scope)
   local function request_device_code()
-    local res = curl.post('https://github.com/login/device/code', {
+    local res = curl.post('https://' .. MC.config.github_instance_url .. '/login/device/code', {
       body = {
         client_id = client_id,
         scope = scope,
@@ -72,7 +85,7 @@ local function github_device_flow(tag, client_id, scope)
   local function poll_for_token(device_code, interval)
     plenary_utils.sleep(interval * 1000)
 
-    local res = curl.post('https://github.com/login/oauth/access_token', {
+    local res = curl.post('https://' .. MC.config.github_instance_url .. '/login/oauth/access_token', {
       json_response = true,
       body = {
         client_id = client_id,
@@ -157,7 +170,7 @@ local function get_github_copilot_token(tag)
         local parsed_data = utils.json_decode(file_data)
         if parsed_data then
           for key, value in pairs(parsed_data) do
-            if string.find(key, 'github.com') and value and value.oauth_token then
+            if string.find(key, MC.config.github_instance_url) and value and value.oauth_token then
               return set_token(tag, value.oauth_token, false)
             end
           end
@@ -184,7 +197,7 @@ local function get_github_models_token(tag)
 
   -- loading token from gh cli if available
   if vim.fn.executable('gh') == 0 then
-    local result = utils.system({ 'gh', 'auth', 'token', '-h', 'github.com' })
+    local result = utils.system({ 'gh', 'auth', 'token', '-h', MC.config.github_instance_url })
     if result and result.code == 0 and result.stdout then
       local gh_token = vim.trim(result.stdout)
       if gh_token ~= '' and not gh_token:find('no oauth token') then
@@ -251,16 +264,32 @@ end
 local M = {}
 
 M.copilot = {
+  endpoints_api = '',
+
   get_headers = function()
-    local response, err = curl.get('https://api.github.com/copilot_internal/v2/token', {
+    local response, err = curl.get('https://' .. MC.config.github_instance_api_url .. '/copilot_internal/v2/token', {
       json_response = true,
       headers = {
-        ['Authorization'] = 'Token ' .. get_github_copilot_token('github_copilot'),
+        ['Authorization'] = 'Token ' .. get_github_copilot_token(MC.config.github_instance_api_url),
       },
     })
 
     if err then
       error(err)
+    end
+
+    if response.body and response.body.endpoints and response.body.endpoints.api then
+      log.info('get_headers ok, authenticated. Use api endpoint: ' .. response.body.endpoints.api)
+      M.endpoints_api = response.body.endpoints.api
+    else
+      log.error(
+        'get_headers authenticated, but missing key "endpoints.api" in server response. response: '
+          .. utils.to_string(response)
+      )
+      error(
+        'get_headers authenticated, but missing key "endpoints.api" in server response. Check log for details: '
+          .. MC.config.log_path
+      )
     end
 
     return {
@@ -323,7 +352,7 @@ M.copilot = {
   end,
 
   get_models = function(headers)
-    local response, err = curl.get('https://api.githubcopilot.com/models', {
+    local response, err = curl.get(M.endpoints_api .. '/models', {
       json_response = true,
       headers = headers,
     })
@@ -368,7 +397,7 @@ M.copilot = {
 
     for _, model in ipairs(models) do
       if not model.policy then
-        pcall(curl.post, 'https://api.githubcopilot.com/models/' .. model.id .. '/policy', {
+        pcall(curl.post, M.endpoints_api .. '/models/' .. model.id .. '/policy', {
           headers = headers,
           json_request = true,
           body = { state = 'enabled' },
@@ -725,11 +754,11 @@ M.copilot = {
   get_url = function(opts)
     -- Check if this model uses the Responses API
     if opts and opts.model and opts.model.use_responses then
-      return 'https://api.githubcopilot.com/responses'
+      return M.endpoints_api .. 'https://api.githubcopilot.com/responses'
     end
 
     -- Default to Chat Completion API
-    return 'https://api.githubcopilot.com/chat/completions'
+    return M.endpoints_api .. '/chat/completions'
   end,
 }
 
